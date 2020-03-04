@@ -30,14 +30,17 @@ Options populateOptions() {
     ("seed", "random seed, default is current time", value<double>()->default_value(std::to_string(time(NULL))))
     //mapping
     ("PEgraphFile", "read communication graph from file", value<std::string>())
-    ("blockSizesFile", " file to read the block sizes for every block", value<std::string>() )
+    ("blockSizesFile", "file to read the block sizes for every block", value<std::string>() )
+    ("mappingRenumbering", "map blocks to PEs using the SFC index of the block's center. This works better when PUs are numbered consecutively." )
     //repartitioning
     ("previousPartition", "file of previous partition, used for repartitioning", value<std::string>())
     //multi-level and local refinement
     ("initialPartition", "Choose initial partitioning method between space-filling curves (geoSFC), balanced k-means (geoKmeans) or the hierarchical version (geoHierKM) and MultiJagged (geoMS). If parmetis or zoltan are installed, you can also choose to partition with them using for example, parMetisGraph or zoltanMJ. For more information, see src/Settings.h file.", value<std::string>())
+    ("initialMigration", "The preprocessing step to distribute data before calling the partitioning algorithm", value<std::string>())
     ("noRefinement", "skip local refinement steps")
     ("multiLevelRounds", "Tuning Parameter: How many multi-level rounds with coarsening to perform", value<IndexType>()->default_value(std::to_string(settings.multiLevelRounds)))
     ("minBorderNodes", "Tuning parameter: Minimum number of border nodes used in each refinement step", value<IndexType>())
+    ("minBorderNodesPercent", "Tuning parameter: Percentage of local nodes used in each refinement step. Recommended  are values around 0.05", value<double>())
     ("stopAfterNoGainRounds", "Tuning parameter: Number of rounds without gain after which to abort localFM. 0 means no stopping.", value<IndexType>())
     ("minGainForNextGlobalRound", "Tuning parameter: Minimum Gain above which the next global FM round is started", value<IndexType>())
     ("gainOverBalance", "Tuning parameter: In local FM step, choose queue with best gain over queue with best balance", value<bool>())
@@ -50,6 +53,8 @@ Options populateOptions() {
     ("bisect", "Used for the multisection method. If set to true the algorithm perfoms bisections (not multisection) until the desired number of parts is reached", value<bool>())
     ("cutsPerDim", "If MultiSection is chosen, then provide d values that define the number of cuts per dimension. You must provide as many numbers as the dimensions separated with commas. For example, --cutsPerDim=3,4,10 for 3 dimensions resulting in 3*4*10=120 blocks", value<std::string>())
     ("pixeledSideLen", "The resolution for the pixeled partition or the spectral", value<IndexType>())
+    //sfc
+    ("sfcResolution", "The resolution depth of the hilbert space filling curve", value<IndexType>())
     // K-Means
     ("minSamplingNodes", "Tuning parameter for K-Means", value<IndexType>())
     ("influenceExponent", "Tuning parameter for K-Means, default is ", value<double>()->default_value(std::to_string(settings.influenceExponent)))
@@ -74,6 +79,7 @@ Options populateOptions() {
     ("repeatTimes", "How many times we repeat the partitioning process.", value<IndexType>())
     ("noComputeDiameter", "Compute diameter of resulting block files.")
     ("maxDiameterRounds", "abort diameter algorithm after that many BFS rounds", value<IndexType>())
+    ("maxCGIterations", "max number of iterations of the CG solver in metrics",  value<IndexType>())
     ("metricsDetail", "no: no metrics, easy:cut, imbalance, communication volume and diameter if possible, all: easy + SpMV time and communication time in SpMV", value<std::string>())
     ("autoSettings", "Set some settings automatically to some values possibly overwriting some user passed parameters. ", value<bool>() )
     ("partition", "file of partition (typically used by tools/analyzePartition)", value<std::string>())
@@ -187,6 +193,7 @@ Settings interpretSettings(cxxopts::ParseResult vm) {
     settings.writeDebugCoordinates = vm.count("writeDebugCoordinates");
     settings.writePEgraph = vm.count("writePEgraph");
     settings.setAutoSettings = vm.count("autoSettings");
+    settings.mappingRenumbering = vm.count("mappingRenumbering");
 
     //28/11/19, deprecate storeInfo parameter. Leaving it as an option for backwards compatibility.    
     //if outFile was provided but storeInfo was not given as an argument
@@ -229,12 +236,19 @@ Settings interpretSettings(cxxopts::ParseResult vm) {
     } else {
         settings.numBlocks = comm->getSize();
     }
+    if (vm.count("sfcResolution")) {
+        settings.sfcResolution = vm["sfcResolution"].as<IndexType>();
+    }
 
     if (vm.count("epsilon")) {
         settings.epsilon = vm["epsilon"].as<double>();
     }
     if (vm.count("blockSizesFile")) {
         settings.blockSizesFile = vm["blockSizesFile"].as<std::string>();
+    }
+    if ( vm.count("initialMigration") ){
+        std::string s = vm["initialMigration"].as<std::string>();
+        settings.initialMigration = to_tool(s);        
     }
     if (vm.count("initialPartition")) {
         std::string s = vm["initialPartition"].as<std::string>();
@@ -245,6 +259,9 @@ Settings interpretSettings(cxxopts::ParseResult vm) {
     }
     if (vm.count("minBorderNodes")) {
         settings.minBorderNodes = vm["minBorderNodes"].as<IndexType>();
+    }
+    if (vm.count("minBorderNodesPercent")) {
+        settings.minBorderNodesPercent = vm["minBorderNodesPercent"].as<double>();
     }
     if (vm.count("stopAfterNoGainRounds")) {
         settings.stopAfterNoGainRounds = vm["stopAfterNoGainRounds"].as<IndexType>();
@@ -327,6 +344,9 @@ Settings interpretSettings(cxxopts::ParseResult vm) {
     if (vm.count("maxDiameterRounds")) {
         settings.maxDiameterRounds = vm["maxDiameterRounds"].as<IndexType>();
     }
+    if (vm.count("maxCGIterations")) {
+        settings.maxCGIterations = vm["maxCGIterations"].as<IndexType>();
+    }    
     if (vm.count("metricsDetail")) {
         settings.metricsDetail = vm["metricsDetail"].as<std::string>();
     }

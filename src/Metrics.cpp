@@ -1,3 +1,6 @@
+#include <scai/solver/criteria/IterationCount.hpp>
+#include <scai/solver/CG.hpp>
+
 #include "Metrics.h"
 #include "FileIO.h"
 
@@ -42,7 +45,9 @@ void Metrics<ValueType>::getMetrics(const scai::lama::CSRSparseMatrix<ValueType>
 template<typename ValueType>
 void Metrics<ValueType>::getAllMetrics(const scai::lama::CSRSparseMatrix<ValueType> graph, const scai::lama::DenseVector<IndexType> partition, const std::vector<scai::lama::DenseVector<ValueType>> nodeWeights, struct Settings settings ) {
 
-    getEasyMetrics( graph, partition, nodeWeights, settings );
+    Settings tmpSettings = settings;
+    settings.computeDiameter=false; //diameter will be computed inside getRedistRequiredMetrics
+    getEasyMetrics( graph, partition, nodeWeights, tmpSettings );
 
     scai::dmemo::CommunicatorPtr comm = graph.getRowDistributionPtr()->getCommunicatorPtr();
     if (settings.numBlocks == comm->getSize()) {
@@ -219,7 +224,9 @@ std::tuple<IndexType,IndexType,IndexType> Metrics<ValueType>::getDiameter( const
             maxBlockDiameter = comm->max(localDiameter);
 
         } else {
-            PRINT0("WARNING: Not computing diameter, not all vertices are in same block everywhere");
+            if(comm->getRank()==0){
+                std::cout<< "WARNING: Not computing diameter, not all vertices are in same block everywhere" << std::endl;
+            }
         }
     }
     std::chrono::duration<ValueType,std::ratio<1>> diameterTime = std::chrono::high_resolution_clock::now() - diameterStart;
@@ -233,7 +240,7 @@ std::tuple<IndexType,IndexType,IndexType> Metrics<ValueType>::getDiameter( const
 //---------------------------------------------------------------------------
 
 template<typename ValueType>
-void Metrics<ValueType>::getRedistRequiredMetrics( const scai::lama::CSRSparseMatrix<ValueType> graph, const scai::lama::DenseVector<IndexType> partition, struct Settings settings, const IndexType repeatTimes ) {
+void Metrics<ValueType>::getRedistRequiredMetrics( const scai::lama::CSRSparseMatrix<ValueType>& graph, const scai::lama::DenseVector<IndexType>& partition, struct Settings settings, const IndexType repeatTimes ) {
 
     scai::dmemo::CommunicatorPtr comm = graph.getRowDistributionPtr()->getCommunicatorPtr();
     const IndexType N = graph.getNumRows();
@@ -248,7 +255,7 @@ void Metrics<ValueType>::getRedistRequiredMetrics( const scai::lama::CSRSparseMa
 
     //TODO: change NoDist with graph.getColumnDistribution() ?
     scai::dmemo::DistributionPtr noDistPtr( new scai::dmemo::NoDistribution( graph.getNumRows() ));
-    scai::lama::CSRSparseMatrix<ValueType> copyGraph( graph );
+    scai::lama::CSRSparseMatrix<ValueType> copyGraph( graph ); 
     copyGraph.redistribute(distFromPartition, noDistPtr);
 
     std::chrono::duration<ValueType> redistributionTime =  std::chrono::steady_clock::now() - beforeRedistribution;
@@ -274,10 +281,32 @@ void Metrics<ValueType>::getRedistRequiredMetrics( const scai::lama::CSRSparseMa
         std::tie( MM["maxBlockDiameter"], MM["harmMeanDiam"], MM["numDisconBlocks"] ) = getDiameter(copyGraph, copyPartition, settings);
     }
 
-    // redistribute for SpMV and commTime
+    //get the NNZ imbalance
+    {
+        const IndexType localNNZ = copyGraph.getLocalNumValues();   
+        const IndexType sumNNZ = comm->sum(localNNZ);
+        //this fails because the cut edges are not counted; it is sumNNZ+ 2*cutedges = copyGraph.getNumValues()
+        //SCAI_ASSERT_EQ_ERROR( sumNNZ, copyGraph.getNumValues(), "??" ); 
+        
+        const IndexType optNNZ = sumNNZ/comm->getSize();
+        const IndexType maxLocalNNZ = comm->max(localNNZ);
+        const IndexType minLocalNNZ = comm->min(localNNZ);
+
+        ValueType edgeImbalance = ValueType( maxLocalNNZ - optNNZ)/optNNZ;
+        PRINT0("minLocalNNZ= "<< minLocalNNZ <<", maxLocalNNZ= " << maxLocalNNZ << ", edge imbalance= " << edgeImbalance);
+        MM["edgeImbalance"] = edgeImbalance;
+    }
+
+    //
+    // redistribute for SpMV, linear solver and commTime
+    //
+
     copyGraph.redistribute( distFromPartition, distFromPartition );
 
     MM["SpMVtime"] = getSPMVtime(copyGraph, repeatTimes);
+
+    //TODO: take a percentage of repeatTimes; maybe all repeatTimes are too much for CG
+    MM["CGtime"] = getLinearSolverTime( copyGraph, 10, settings.maxCGIterations); 
 
     //TODO: maybe extract this time from the actual SpMV above
     // comm time in SpMV
@@ -477,6 +506,7 @@ void Metrics<ValueType>::getMappingMetrics(
     getMappingMetrics( blockGraph, PEGraph, identityMapping);
 }//getMappingMetrics
 //---------------------------------------------------------------------------------------
+
 template<typename ValueType>
 ValueType Metrics<ValueType>::getSPMVtime(
     scai::lama::CSRSparseMatrix<ValueType> graph,
@@ -491,7 +521,7 @@ ValueType Metrics<ValueType>::getSPMVtime(
     graph.setCommunicationKind( scai::lama::SyncKind::ASYNC_COMM );
     comm->synchronize();
     
-    // perfom the actual multiplication
+    // perform the actual multiplication
     std::chrono::time_point<std::chrono::steady_clock> beforeSpMVTime = std::chrono::steady_clock::now();
     for(IndexType r=0; r<repeatTimes; r++) {
         y = graph *x +y;
@@ -501,14 +531,64 @@ ValueType Metrics<ValueType>::getSPMVtime(
     //PRINT(" SpMV time for PE "<< comm->getRank() << " = " << SpMVTime.count() );
 
     ValueType time = comm->max(SpMVTime.count());
-    time = time/repeatTimes;
+    PRINT0("max time for " << repeatTimes <<" SpMVs: " << time );
 
-    ValueType minTime = comm->min( SpMVTime.count() );
-    PRINT0("max time for " << repeatTimes <<" SpMVs: " << time << " , min time " << minTime);
-
-    return time;
+    return time/repeatTimes;
 }
+//---------------------------------------------------------------------------------------
 
+template<typename ValueType>
+ValueType Metrics<ValueType>::getLinearSolverTime( 
+    const scai::lama::CSRSparseMatrix<ValueType>& graph,
+    const IndexType repeatTimes,
+    const IndexType maxIterations){
+
+    const scai::dmemo::CommunicatorPtr comm = graph.getRowDistributionPtr()->getCommunicatorPtr();
+    const scai::dmemo::DistributionPtr rowDist = graph.getRowDistributionPtr();
+    const scai::dmemo::DistributionPtr colDist = graph.getColDistributionPtr();
+
+    //the construction of the laplacian does not work when both rows and columns are distributed
+    //based on a general distribution; TODO:fix
+    //workaround: copy graph to preserve const-ness, redistribute with a block distribution, get
+    //the laplacian, redistribute the laplacian with the same distribution as the input
+    scai::lama::CSRSparseMatrix<ValueType> laplacian;
+    {
+        scai::lama::CSRSparseMatrix<ValueType> copyGraph( graph ); 
+        const IndexType N = graph.getNumRows();
+        const scai::dmemo::DistributionPtr blockDistPtr( new scai::dmemo::BlockDistribution(N, comm) );
+        copyGraph.redistribute( blockDistPtr, blockDistPtr );
+        
+        laplacian = GraphUtils<IndexType,ValueType>::constructLaplacian( copyGraph );
+        laplacian.redistribute( rowDist, colDist);
+    }
+
+    scai::lama::DenseVector<ValueType> solution( colDist, ValueType(1.0) );
+    
+    scai::solver::CG<ValueType> solver("CGSolver");
+
+    scai::solver::CriterionPtr<ValueType> criterion( new scai::solver::IterationCount<ValueType>( maxIterations ) );
+    solver.setStoppingCriterion( criterion );
+    ValueType totalTime = 0.0;
+
+    for(IndexType r=0; r<repeatTimes; r++) {
+        const scai::lama::DenseVector<ValueType> rhs( colDist, ValueType(1.0) );
+        solver.initialize( laplacian );
+
+        std::chrono::time_point<std::chrono::steady_clock> beforeTime = std::chrono::steady_clock::now();
+
+        solver.solve(solution, rhs);
+
+        std::chrono::duration<ValueType> elapTime = std::chrono::steady_clock::now() - beforeTime;
+        totalTime += elapTime.count();
+        //PRINT(" SpMV time for PE "<< comm->getRank() << " = " << SpMVTime.count() );
+    }
+    ValueType globTime = comm->max(totalTime)/repeatTimes;
+    
+    PRINT0("total time for "<< repeatTimes << " calls to CG solver: " << totalTime );
+
+    return globTime;
+}
 
 template class Metrics<double>;
 template class Metrics<float>;
+

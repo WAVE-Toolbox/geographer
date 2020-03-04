@@ -181,16 +181,19 @@ ITI::Settings ITI::Settings::setDefault( const scai::lama::CSRSparseMatrix<Value
     const scai::dmemo::DistributionPtr dist = graph.getRowDistributionPtr();
     const long int localN = dist->getLocalSize();
 
-    retSet.minBorderNodes = std::max( int(localN*0.1), 1); //10% of local nodes
-    retSet.stopAfterNoGainRounds = 5;
-    long int localCut =  graph.getHaloStorage().getNumValues();
-    retSet.minGainForNextRound = std::max( int(localCut*0.1), 1); //10% of local halo
+    retSet.minBorderNodes = std::max( int(localN*minBorderNodesPercent), 1); //10% of local nodes
+    const scai::dmemo::CommunicatorPtr comm = dist->getCommunicatorPtr();
+    if(comm->getRank() == 0 ){
+        std::cout << "\tsetting (in PE 0) minBorderNodes to " << retSet.minBorderNodes << std::endl;
+    }
+
+    retSet.stopAfterNoGainRounds = 2;
 
     //TODO: when we set the minSamplingNodes, kmeans hangs after roundsTillAll rounds
     //long int roundsTillAll = 6; //in how many rounds we get all local points
     //retSet.minSamplingNodes = localN/std::pow(2,roundsTillAll);
 
-    retSet.multiLevelRounds = 9; //no reason...
+    //minGainForNextRound is set inside ParcoRepart::doLocalRefinement()
 
     return retSet;
 }
